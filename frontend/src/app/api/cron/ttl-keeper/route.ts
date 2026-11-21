@@ -232,15 +232,22 @@ export async function GET(request: NextRequest) {
         return NextResponse.json({ success: false, error: auth.error }, { status: auth.status });
     }
 
+    const supabase = getServiceRoleClient();
+
     if (!process.env.TTL_KEEPER_ACCOUNT_SECRET) {
         structuredLog('WARN', 'TTL keeper skipped: no keeper account configured', requestId);
+        // Record the failed run before returning so admin stats surface it.
+        await supabase.from('cron_run_log').insert({
+            job_name: 'ttl-keeper',
+            run_id: runId,
+            status: 'failed',
+            summary: { error: 'TTL_KEEPER_ACCOUNT_SECRET not configured', durationMs: Date.now() - startMs },
+        });
         return NextResponse.json({
             success: false,
             error: 'TTL_KEEPER_ACCOUNT_SECRET not configured',
         }, { status: 503 });
     }
-
-    const supabase = getServiceRoleClient();
     const cursorStart = await readCursor(supabase);
 
     // Fetch a page of credential token IDs, continuing from the cursor.
@@ -341,8 +348,36 @@ export async function GET(request: NextRequest) {
         wrapped,
     };
 
+    // Classify the run:
+    //   'failed'    — every attempted bump failed (total outage)
+    //   'partial'   — some bumps succeeded, some failed
+    //   'succeeded' — all attempted bumps succeeded (or nothing needed bumping)
+    const runStatus: 'succeeded' | 'partial' | 'failed' =
+        bumpAttempted > 0 && bumpFailed === bumpAttempted
+            ? 'failed'
+            : bumpFailed > 0
+            ? 'partial'
+            : 'succeeded';
+
+    // Persist the run so admin stats can surface it without polling cron logs.
+    const { error: logError } = await supabase.from('cron_run_log').insert({
+        job_name: 'ttl-keeper',
+        run_id: runId,
+        status: runStatus,
+        summary,
+    });
+    if (logError) {
+        // A logging failure is not a reason to report the keeper as broken, but
+        // it means admin stats will show stale data — log it clearly.
+        structuredLog('ERROR', 'TTL keeper: failed to write cron_run_log', requestId, {
+            runId,
+            error: logError,
+        });
+    }
+
     structuredLog('INFO', 'TTL keeper run complete', requestId, {
         runId,
+        runStatus,
         bumpAttempted,
         bumpSucceeded,
         bumpFailed,
@@ -353,5 +388,5 @@ export async function GET(request: NextRequest) {
         durationMs: summary.durationMs,
     });
 
-    return NextResponse.json({ success: true, summary, alert: lowTtl || lowBalance });
+    return NextResponse.json({ success: true, summary, runStatus, alert: lowTtl || lowBalance });
 }

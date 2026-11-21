@@ -157,3 +157,83 @@ describe('TTL keeper cron route', () => {
     expect(body).toHaveProperty('lowBalance', true);
   });
 });
+
+// ── cron_run_log and failure classification (#135, #136) ──────────────────
+
+describe('TTL keeper: cron_run_log persistence and run status', () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.clearAllMocks();
+    process.env = {
+      ...ORIGINAL_ENV,
+      CRON_SECRET: 'test-secret',
+      TTL_KEEPER_ACCOUNT_SECRET: 'SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA1',
+    };
+
+    mockFrom.mockReturnValue({
+      insert: mockInsert.mockResolvedValue({ error: null }),
+      select: mockSelect.mockReturnValue({
+        eq: vi.fn().mockReturnValue({
+          order: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue({ data: [], error: null }),
+          }),
+        }),
+      }),
+    });
+  });
+
+  afterEach(() => {
+    process.env = ORIGINAL_ENV;
+  });
+
+  it('writes a succeeded status to cron_run_log when all bumps succeed', async () => {
+    // A run with no credentials to process (empty page) is a clean succeeded run.
+    const { GET } = await import('@/app/api/cron/ttl-keeper/route');
+    const res = await GET(makeRequest({ authorization: 'Bearer test-secret' }));
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as { runStatus?: string };
+    expect(body.runStatus).toBe('succeeded');
+
+    // The insert call that writes to cron_run_log must have been made.
+    const insertCalls = mockInsert.mock.calls.filter((call) => {
+      const arg = call[0] as { job_name?: string } | undefined;
+      return arg && arg.job_name === 'ttl-keeper';
+    });
+    expect(insertCalls.length).toBeGreaterThanOrEqual(1);
+    const loggedRow = insertCalls[0][0] as { status: string };
+    expect(loggedRow.status).toBe('succeeded');
+  });
+
+  it('writes a failed status and returns 503 when TTL_KEEPER_ACCOUNT_SECRET is missing', async () => {
+    process.env.TTL_KEEPER_ACCOUNT_SECRET = '';
+    delete process.env.TTL_KEEPER_ACCOUNT_SECRET;
+
+    const { GET } = await import('@/app/api/cron/ttl-keeper/route');
+    const res = await GET(makeRequest({ authorization: 'Bearer test-secret' }));
+
+    expect(res.status).toBe(503);
+
+    // A failed run must still be logged — that is what allows admin stats to
+    // distinguish a silent outage from a healthy run.
+    const failureLogs = mockInsert.mock.calls.filter((call) => {
+      const arg = call[0] as { job_name?: string; status?: string } | undefined;
+      return arg && arg.job_name === 'ttl-keeper' && arg.status === 'failed';
+    });
+    expect(failureLogs.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('cron_run_log row includes the run_id and a summary payload', async () => {
+    const { GET } = await import('@/app/api/cron/ttl-keeper/route');
+    await GET(makeRequest({ authorization: 'Bearer test-secret' }));
+
+    const insertCalls = mockInsert.mock.calls.filter((call) => {
+      const arg = call[0] as { job_name?: string } | undefined;
+      return arg && arg.job_name === 'ttl-keeper';
+    });
+    expect(insertCalls.length).toBeGreaterThanOrEqual(1);
+    const row = insertCalls[0][0] as { run_id?: string; summary?: unknown };
+    expect(typeof row.run_id).toBe('string');
+    expect(row.summary).toBeTruthy();
+  });
+});
